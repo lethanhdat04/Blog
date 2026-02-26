@@ -1,3 +1,4 @@
+import Image from "next/image";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { formatDateShort } from "@/lib/utils";
@@ -47,21 +48,35 @@ export function Timeline({ items }: TimelineProps) {
             }`}>
               <Card>
                 <CardHeader>
-                  <div className="flex items-center justify-between">
-                    <CardTitle className="text-lg">{item.position}</CardTitle>
-                    {item.current && (
-                      <Badge variant="default" className="text-xs">
-                        Current
-                      </Badge>
+                  <div className="flex items-start gap-3">
+                    {item.logo && (
+                      <div className="relative h-10 w-10 shrink-0 overflow-hidden rounded-lg border bg-muted">
+                        <Image
+                          src={item.logo}
+                          alt={`${item.company} logo`}
+                          fill
+                          className="object-cover"
+                        />
+                      </div>
                     )}
-                  </div>
-                  <div className="text-sm text-muted-foreground">
-                    <p className="font-medium">{item.company}</p>
-                    <p>
-                      {item.location && `${item.location} · `}
-                      {formatDateShort(item.startDate)} —{" "}
-                      {item.endDate ? formatDateShort(item.endDate) : "Present"}
-                    </p>
+                    <div className="flex-1">
+                      <div className="flex items-center justify-between">
+                        <CardTitle className="text-lg">{item.position}</CardTitle>
+                        {item.current && (
+                          <Badge variant="default" className="text-xs">
+                            Current
+                          </Badge>
+                        )}
+                      </div>
+                      <div className="text-sm text-muted-foreground">
+                        <p className="font-medium">{item.company}</p>
+                        <p>
+                          {item.location && `${item.location} · `}
+                          {formatDateShort(item.startDate)} —{" "}
+                          {item.endDate ? formatDateShort(item.endDate) : "Present"}
+                        </p>
+                      </div>
+                    </div>
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-4">

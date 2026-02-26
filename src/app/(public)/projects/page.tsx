@@ -43,6 +43,7 @@ export default async function ProjectsPage() {
               techStack={project.techStack}
               githubUrl={project.githubUrl}
               liveUrl={project.liveUrl}
+              featured={project.featured}
             />
           ))}
         </div>

@@ -1,6 +1,6 @@
 import Link from "next/link";
 import Image from "next/image";
-import { ExternalLink, Github } from "lucide-react";
+import { ExternalLink, Github, Star } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,6 +20,7 @@ interface ProjectCardProps {
   techStack: string[];
   githubUrl?: string | null;
   liveUrl?: string | null;
+  featured?: boolean;
 }
 
 export function ProjectCard({
@@ -30,6 +31,7 @@ export function ProjectCard({
   techStack,
   githubUrl,
   liveUrl,
+  featured,
 }: ProjectCardProps) {
   return (
     <Card className="flex h-full flex-col overflow-hidden">
@@ -42,6 +44,14 @@ export function ProjectCard({
               fill
               className="object-cover transition-transform hover:scale-105"
             />
+            {featured && (
+              <div className="absolute left-3 top-3">
+                <Badge className="gap-1 bg-primary/90 backdrop-blur-sm">
+                  <Star className="h-3 w-3" />
+                  Featured
+                </Badge>
+              </div>
+            )}
           </div>
         </Link>
       )}
@@ -60,6 +70,9 @@ export function ProjectCard({
               {tech}
             </Badge>
           ))}
+          {techStack.length > 5 && (
+            <Badge variant="outline">+{techStack.length - 5}</Badge>
+          )}
         </div>
       </CardContent>
       <CardFooter className="gap-2">
