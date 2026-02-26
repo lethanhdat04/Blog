@@ -1,0 +1,70 @@
+---
+title: "Next.js Server Actions: The Complete Guide"
+description: "Learn how to use Server Actions in Next.js for type-safe mutations, form handling, and database operations without API routes."
+date: "2026-02-15"
+published: true
+featured: false
+tags: ["next.js", "react", "server-actions"]
+authors: ["Datto"]
+---
+
+## What Are Server Actions?
+
+Server Actions are asynchronous functions that are executed on the server. They can be used in Server and Client Components to handle form submissions and data mutations in Next.js applications.
+
+## Basic Usage
+
+Here's a simple example of a Server Action:
+
+```tsx title="app/actions.ts"
+"use server";
+
+import { prisma } from "@/lib/prisma";
+import { revalidatePath } from "next/cache";
+
+export async function createPost(formData: FormData) {
+  const title = formData.get("title") as string;
+  const content = formData.get("content") as string;
+
+  await prisma.post.create({
+    data: { title, content },
+  });
+
+  revalidatePath("/blog");
+}
+```
+
+## Form Integration
+
+Server Actions work seamlessly with HTML forms:
+
+```tsx title="components/create-post-form.tsx"
+import { createPost } from "@/app/actions";
+
+export function CreatePostForm() {
+  return (
+    <form action={createPost}>
+      <input name="title" required />
+      <textarea name="content" required />
+      <button type="submit">Create Post</button>
+    </form>
+  );
+}
+```
+
+## Validation with Zod
+
+Always validate your inputs:
+
+```typescript title="lib/validations/post.ts"
+import { z } from "zod";
+
+export const createPostSchema = z.object({
+  title: z.string().min(1, "Title is required").max(120),
+  content: z.string().min(10, "Content must be at least 10 characters"),
+});
+```
+
+## Conclusion
+
+Server Actions simplify data mutations in Next.js by eliminating the need for separate API routes while maintaining type safety and security.

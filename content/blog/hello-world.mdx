@@ -1,0 +1,61 @@
+---
+title: "Hello World: Building My Developer Portfolio"
+description: "Welcome to my new blog! In this post, I share why I built this portfolio and what technologies power it."
+date: "2026-02-26"
+published: true
+featured: true
+tags: ["next.js", "react", "mdx", "portfolio"]
+authors: ["Datto"]
+---
+
+## Welcome
+
+Welcome to my developer portfolio blog! This is the first post on my new site, and I'm excited to share what powers it under the hood.
+
+## Tech Stack
+
+This portfolio is built with a modern stack designed for performance and developer experience:
+
+- **Next.js 14** with App Router for server-side rendering and static generation
+- **MDX** via Velite for type-safe, git-tracked blog posts
+- **Tailwind CSS** with Shadcn UI for a beautiful, consistent design system
+- **Prisma** with PostgreSQL for dynamic content management
+- **Framer Motion** for smooth animations
+
+## Code Example
+
+Here's a simple React component that showcases the power of Server Components:
+
+```tsx title="app/page.tsx"
+import { posts } from "#site/content";
+
+export default function HomePage() {
+  const latestPosts = posts
+    .filter((post) => post.published)
+    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+    .slice(0, 3);
+
+  return (
+    <section>
+      <h1>Latest Posts</h1>
+      {latestPosts.map((post) => (
+        <article key={post.slug}>
+          <h2>{post.title}</h2>
+          <p>{post.description}</p>
+        </article>
+      ))}
+    </section>
+  );
+}
+```
+
+## What's Next
+
+I'll be writing about:
+
+1. **Building scalable React applications** with Next.js
+2. **Database design patterns** with Prisma
+3. **DevOps and deployment** strategies
+4. **AI-powered development** workflows
+
+Stay tuned for more content!

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node:*)",
+      "WebSearch",
+      "WebFetch(domain:velite.js.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:authjs.dev)",
+      "Bash(python3:*)",
+      "Bash(npm install:*)",
+      "Bash(npx prisma:*)",
+      "Bash(timeout 30 npm run:*)",
+      "Bash(npx next:*)"
+    ]
+  }
+}

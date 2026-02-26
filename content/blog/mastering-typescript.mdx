@@ -1,0 +1,99 @@
+---
+title: "Mastering TypeScript: Advanced Patterns for React Developers"
+description: "Explore advanced TypeScript patterns including generic components, discriminated unions, and type-safe API layers for modern React applications."
+date: "2026-02-20"
+published: true
+featured: false
+tags: ["typescript", "react", "patterns"]
+authors: ["Datto"]
+---
+
+## Introduction
+
+TypeScript has become the standard for modern React development. In this post, we'll explore advanced patterns that will level up your TypeScript skills.
+
+## Generic Components
+
+One of the most powerful TypeScript patterns is creating generic components:
+
+```tsx title="components/data-table.tsx"
+interface DataTableProps<T> {
+  data: T[];
+  columns: {
+    key: keyof T;
+    label: string;
+    render?: (value: T[keyof T], item: T) => React.ReactNode;
+  }[];
+  onRowClick?: (item: T) => void;
+}
+
+export function DataTable<T extends Record<string, unknown>>({
+  data,
+  columns,
+  onRowClick,
+}: DataTableProps<T>) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          {columns.map((col) => (
+            <th key={String(col.key)}>{col.label}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {data.map((item, i) => (
+          <tr key={i} onClick={() => onRowClick?.(item)}>
+            {columns.map((col) => (
+              <td key={String(col.key)}>
+                {col.render
+                  ? col.render(item[col.key], item)
+                  : String(item[col.key])}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+## Discriminated Unions
+
+Discriminated unions are perfect for handling different states:
+
+```typescript title="types/api.ts"
+type ApiState<T> =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; data: T }
+  | { status: "error"; error: string };
+```
+
+## Type-Safe Server Actions
+
+With Next.js Server Actions, we can create fully type-safe mutations:
+
+```typescript title="lib/actions/project.ts"
+"use server";
+
+import { z } from "zod";
+
+const createProjectSchema = z.object({
+  title: z.string().min(1),
+  description: z.string().min(10),
+  techStack: z.array(z.string()),
+});
+
+export async function createProject(
+  formData: z.infer<typeof createProjectSchema>
+) {
+  const validated = createProjectSchema.parse(formData);
+  // ... create in database
+}
+```
+
+## Conclusion
+
+These patterns create a robust foundation for any React + TypeScript project. The key is leveraging the type system to catch errors at compile time rather than runtime.
