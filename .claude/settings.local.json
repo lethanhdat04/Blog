@@ -10,7 +10,8 @@
       "Bash(npm install:*)",
       "Bash(npx prisma:*)",
       "Bash(timeout 30 npm run:*)",
-      "Bash(npx next:*)"
+      "Bash(npx next:*)",
+      "Bash(xargs ls:*)"
     ]
   }
 }

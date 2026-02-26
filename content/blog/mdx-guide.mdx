@@ -1,0 +1,253 @@
+---
+title: "MDX là gì? Hướng dẫn từ A-Z cho Developer"
+description: "Tìm hiểu MDX - sự kết hợp giữa Markdown và JSX. Hướng dẫn cài đặt, cấu hình và sử dụng MDX trong dự án Next.js."
+date: "2026-02-26"
+published: true
+featured: true
+tags: ["mdx", "next.js", "react", "markdown"]
+authors: ["Datto"]
+---
+
+## MDX là gì?
+
+MDX là **Markdown + JSX**. Bạn viết nội dung bằng Markdown như bình thường, nhưng có thể nhúng React components trực tiếp vào bài viết.
+
+Markdown thông thường chỉ hỗ trợ text, heading, link, hình ảnh và code block. MDX mở rộng thêm khả năng **nhúng component tương tác** vào giữa nội dung.
+
+## So sánh Markdown vs MDX
+
+Một file **Markdown** thông thường:
+
+```md
+# Tiêu đề
+
+Đây là đoạn văn bản bình thường.
+
+- Item 1
+- Item 2
+```
+
+Một file **MDX** có thể làm thêm:
+
+```mdx
+# Tiêu đề
+
+Đây là đoạn văn bản bình thường.
+
+<Alert type="info">
+  Đây là React component nhúng trong bài viết!
+</Alert>
+
+<InteractiveDemo />
+```
+
+## Cài đặt MDX trong Next.js
+
+### Cách 1: Dùng @next/mdx (chính thức)
+
+Cài đặt các package cần thiết:
+
+```bash
+npm install @next/mdx @mdx-js/loader @mdx-js/react
+```
+
+Cấu hình `next.config.mjs`:
+
+```js title="next.config.mjs"
+import createMDX from "@next/mdx";
+
+const withMDX = createMDX({
+  extension: /\.mdx?$/,
+});
+
+export default withMDX({
+  pageExtensions: ["js", "jsx", "ts", "tsx", "md", "mdx"],
+});
+```
+
+Sau đó tạo file `app/blog/page.mdx` và viết nội dung trực tiếp.
+
+### Cách 2: Dùng Velite (blog này đang dùng)
+
+Velite biên dịch MDX thành JSON tĩnh, phù hợp cho blog với nhiều bài viết.
+
+```bash
+npm install velite
+```
+
+Cấu hình `velite.config.ts`:
+
+```ts title="velite.config.ts"
+import { defineConfig, s } from "velite";
+
+export default defineConfig({
+  collections: {
+    posts: {
+      name: "Post",
+      pattern: "blog/**/*.mdx",
+      schema: s.object({
+        title: s.string(),
+        description: s.string(),
+        date: s.isodate(),
+        published: s.boolean().default(false),
+        tags: s.array(s.string()).default([]),
+        body: s.mdx(),
+      }),
+    },
+  },
+});
+```
+
+### Cách 3: Dùng Contentlayer
+
+```bash
+npm install contentlayer next-contentlayer
+```
+
+Contentlayer cũng biên dịch MDX thành type-safe JSON, tương tự Velite.
+
+## Syntax Highlighting
+
+MDX không tự highlight code. Cần thêm plugin **rehype-pretty-code** hoặc **Shiki**:
+
+```bash
+npm install rehype-pretty-code shiki
+```
+
+Cấu hình trong Velite:
+
+```ts title="velite.config.ts"
+import rehypePrettyCode from "rehype-pretty-code";
+
+// trong mdx options:
+mdx: {
+  rehypePlugins: [
+    [rehypePrettyCode, { theme: "one-dark-pro" }],
+  ],
+}
+```
+
+Kết quả - code block sẽ được highlight:
+
+```tsx
+function Hello({ name }: { name: string }) {
+  return <h1>Hello, {name}!</h1>;
+}
+```
+
+```python
+def fibonacci(n: int) -> int:
+    if n <= 1:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+```
+
+```css
+.container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+}
+```
+
+## Frontmatter
+
+Mỗi file MDX bắt đầu bằng **frontmatter** - metadata của bài viết:
+
+```yaml
+---
+title: "Tiêu đề bài viết"
+description: "Mô tả ngắn"
+date: "2026-02-26"
+published: true
+featured: false
+tags: ["react", "next.js"]
+authors: ["Datto"]
+---
+```
+
+| Field | Mô tả |
+|-------|--------|
+| `title` | Tiêu đề hiển thị |
+| `description` | Mô tả cho SEO |
+| `date` | Ngày xuất bản |
+| `published` | `true` để hiển thị, `false` là draft |
+| `featured` | Hiển thị trên trang chủ |
+| `tags` | Phân loại bài viết |
+| `authors` | Tác giả |
+
+## Cú pháp Markdown cơ bản
+
+### Text formatting
+
+```md
+**Bold text**
+*Italic text*
+~~Strikethrough~~
+`inline code`
+[Link text](https://example.com)
+```
+
+### Headings
+
+```md
+## Heading 2
+### Heading 3
+#### Heading 4
+```
+
+### Lists
+
+```md
+- Unordered item 1
+- Unordered item 2
+
+1. Ordered item 1
+2. Ordered item 2
+```
+
+### Blockquote
+
+```md
+> Đây là một blockquote.
+> Có thể nhiều dòng.
+```
+
+> Đây là một blockquote. Thường dùng để trích dẫn hoặc ghi chú quan trọng.
+
+### Table
+
+```md
+| Cột 1 | Cột 2 | Cột 3 |
+|--------|--------|--------|
+| A | B | C |
+| D | E | F |
+```
+
+### Hình ảnh
+
+```md
+![Alt text](/images/example.png)
+```
+
+## Khi nào nên dùng MDX?
+
+### Nên dùng
+
+- Blog kỹ thuật cần code snippets
+- Documentation site
+- Nội dung cần nhúng component tương tác (demo, playground)
+- Dự án cá nhân, ít người viết bài
+
+### Không nên dùng
+
+- Blog nhiều người cùng viết (dùng CMS thay thế)
+- Nội dung thay đổi thường xuyên (dùng database)
+- Người viết không quen Markdown/code
+
+## Tổng kết
+
+MDX là công cụ mạnh cho developer blog, kết hợp sự đơn giản của Markdown với sức mạnh của React. Tuy nhiên, nếu bạn chỉ cần viết text + code thì Markdown thông thường lưu trong database cũng hoàn toàn đủ dùng.
+
+Lựa chọn phụ thuộc vào nhu cầu cụ thể của dự án. Không có giải pháp nào là tốt nhất cho mọi trường hợp.
