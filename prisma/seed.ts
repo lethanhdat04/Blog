@@ -569,10 +569,16 @@ async function main() {
       { slug: "blog/hello-world", views: 1247, likes: 38 },
       { slug: "blog/mastering-typescript", views: 3891, likes: 112 },
       { slug: "blog/nextjs-server-actions", views: 2156, likes: 67 },
+      { slug: "blog/system-design-url-shortener", views: 5420, likes: 187 },
+      { slug: "blog/system-design-rate-limiter", views: 4103, likes: 134 },
+      { slug: "blog/system-design-notification-system", views: 3567, likes: 98 },
+      { slug: "blog/system-design-chat-application", views: 6234, likes: 215 },
+      { slug: "blog/system-design-distributed-cache", views: 4891, likes: 156 },
+      { slug: "blog/system-design-event-driven-architecture", views: 5102, likes: 178 },
     ],
   });
 
-  console.log("Seed completed: 6 projects, 5 experiences, 24 skills, 12 tags, 3 post metas");
+  console.log("Seed completed: 6 projects, 5 experiences, 24 skills, 12 tags, 9 post metas");
 }
 
 main()

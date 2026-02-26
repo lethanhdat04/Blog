@@ -1,0 +1,298 @@
+---
+title: "System Design: Building a Scalable Notification System"
+description: "Design a multi-channel notification system handling push, email, SMS, and in-app notifications with priority queues, deduplication, and user preferences."
+date: "2026-02-18"
+published: true
+featured: false
+tags: ["system-design", "architecture", "messaging", "queues"]
+authors: ["Datto"]
+---
+
+## The Problem
+
+Design a notification system that supports multiple channels (push, email, SMS, in-app), handles millions of notifications per day, respects user preferences, and guarantees delivery without duplicates.
+
+This is a bread-and-butter system design problem that appears in many real-world applications — from e-commerce order updates to social media alerts.
+
+## Requirements
+
+### Functional
+
+- Send notifications via push, email, SMS, and in-app channels
+- User preference management (opt-in/out per channel and category)
+- Template-based notification content
+- Scheduling (send later) and batching (digest emails)
+- Delivery tracking and retry logic
+
+### Non-Functional
+
+- **Throughput**: 10M notifications/day (~115/sec average, 1000/sec peak)
+- **Latency**: Real-time notifications delivered within 5 seconds
+- **Reliability**: At-least-once delivery with deduplication
+- **Extensibility**: Easy to add new channels
+
+## High-Level Architecture
+
+```text
+                  ┌─────────────┐
+  Trigger ──────▶ │ Notification │
+  (API/Event)     │   Service    │
+                  └──────┬──────┘
+                         │
+                    ┌────▼────┐
+                    │  Kafka  │
+                    │ (topic  │
+                    │ per     │
+                    │ priority│)
+                    └────┬────┘
+                         │
+           ┌─────────────┼─────────────┐
+           ▼             ▼             ▼
+    ┌────────────┐ ┌────────────┐ ┌────────────┐
+    │   Push     │ │   Email    │ │   SMS      │
+    │  Worker    │ │  Worker    │ │  Worker    │
+    │  (FCM/APNs)│ │  (Resend)  │ │  (Twilio)  │
+    └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
+          │              │              │
+          └──────────────┼──────────────┘
+                         ▼
+                  ┌─────────────┐
+                  │  Delivery   │
+                  │   Store     │
+                  │ (PostgreSQL)│
+                  └─────────────┘
+```
+
+## Core Components
+
+### 1. Notification Service (Entry Point)
+
+The gateway that receives notification requests, validates them, and fans out to the appropriate channels.
+
+```typescript title="services/notification-service.ts"
+interface NotificationRequest {
+  userId: string;
+  type: "order_shipped" | "new_message" | "price_alert" | "security";
+  channels: ("push" | "email" | "sms" | "in_app")[];
+  priority: "critical" | "high" | "normal" | "low";
+  data: Record<string, unknown>;
+  scheduledAt?: Date;
+  idempotencyKey: string;
+}
+
+async function sendNotification(request: NotificationRequest) {
+  // 1. Deduplication check
+  if (await isDuplicate(request.idempotencyKey)) {
+    return { status: "duplicate", skipped: true };
+  }
+
+  // 2. Fetch user preferences
+  const prefs = await getUserPreferences(request.userId);
+
+  // 3. Filter channels based on preferences
+  const channels = request.channels.filter(
+    (ch) => prefs.channels[ch]?.enabled && prefs.categories[request.type]
+  );
+
+  // 4. Render templates per channel
+  const messages = await Promise.all(
+    channels.map((channel) => renderTemplate(channel, request.type, request.data))
+  );
+
+  // 5. Publish to message queue
+  for (let i = 0; i < channels.length; i++) {
+    await kafka.produce({
+      topic: `notifications.${request.priority}`,
+      message: {
+        channel: channels[i],
+        userId: request.userId,
+        content: messages[i],
+        idempotencyKey: request.idempotencyKey,
+      },
+    });
+  }
+
+  return { status: "queued", channels };
+}
+```
+
+### 2. Priority Queue Design
+
+Not all notifications are equal. A password reset email is more urgent than a weekly digest.
+
+```text
+Topic: notifications.critical  → 10 consumers, instant processing
+Topic: notifications.high      → 5 consumers, < 30s SLA
+Topic: notifications.normal    → 3 consumers, < 5min SLA
+Topic: notifications.low       → 1 consumer, best-effort (batched)
+```
+
+### 3. Channel Workers
+
+Each channel has dedicated workers that handle the third-party integration:
+
+```typescript title="workers/email-worker.ts"
+async function processEmailNotification(message: QueueMessage) {
+  const { userId, content, idempotencyKey } = message;
+
+  // Idempotency check at worker level
+  const existing = await db.delivery.findUnique({
+    where: { idempotencyKey_channel: { idempotencyKey, channel: "email" } },
+  });
+  if (existing?.status === "delivered") return;
+
+  try {
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user?.email) throw new Error("No email address");
+
+    const result = await resend.emails.send({
+      to: user.email,
+      subject: content.subject,
+      html: content.html,
+    });
+
+    await db.delivery.upsert({
+      where: { idempotencyKey_channel: { idempotencyKey, channel: "email" } },
+      create: {
+        idempotencyKey,
+        channel: "email",
+        userId,
+        status: "delivered",
+        externalId: result.id,
+        deliveredAt: new Date(),
+      },
+      update: { status: "delivered", externalId: result.id },
+    });
+  } catch (error) {
+    await db.delivery.upsert({
+      where: { idempotencyKey_channel: { idempotencyKey, channel: "email" } },
+      create: { idempotencyKey, channel: "email", userId, status: "failed" },
+      update: { status: "failed", attempts: { increment: 1 } },
+    });
+
+    // Retry with exponential backoff
+    throw error; // Queue will retry
+  }
+}
+```
+
+## Database Schema
+
+```sql title="schema.sql"
+CREATE TABLE notification_preferences (
+  user_id     UUID PRIMARY KEY,
+  channels    JSONB NOT NULL DEFAULT '{"push": true, "email": true, "sms": false}',
+  categories  JSONB NOT NULL DEFAULT '{}',
+  quiet_hours JSONB, -- {"start": "22:00", "end": "08:00", "timezone": "US/Pacific"}
+  updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE notification_deliveries (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  idempotency_key VARCHAR(255) NOT NULL,
+  channel         VARCHAR(20) NOT NULL,
+  user_id         UUID NOT NULL,
+  type            VARCHAR(50) NOT NULL,
+  status          VARCHAR(20) NOT NULL, -- queued, sent, delivered, failed, bounced
+  external_id     VARCHAR(255),
+  attempts        INT DEFAULT 1,
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  delivered_at    TIMESTAMPTZ,
+  UNIQUE(idempotency_key, channel)
+);
+
+CREATE TABLE in_app_notifications (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL,
+  type       VARCHAR(50) NOT NULL,
+  title      VARCHAR(255) NOT NULL,
+  body       TEXT,
+  read       BOOLEAN DEFAULT FALSE,
+  action_url VARCHAR(500),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_in_app_user_unread
+  ON in_app_notifications(user_id, created_at DESC)
+  WHERE read = FALSE;
+```
+
+## Template System
+
+Decouple content from delivery logic using templates:
+
+```typescript title="templates/order-shipped.ts"
+const orderShippedTemplate = {
+  push: {
+    title: "Your order is on its way!",
+    body: "Order #{{orderId}} shipped via {{carrier}}. Track: {{trackingUrl}}",
+  },
+  email: {
+    subject: "Order #{{orderId}} has shipped",
+    template: "order-shipped", // React Email template
+  },
+  sms: {
+    body: "Your order #{{orderId}} shipped! Track at {{trackingUrl}}",
+  },
+  in_app: {
+    title: "Order Shipped",
+    body: "Order #{{orderId}} is on its way via {{carrier}}",
+    actionUrl: "/orders/{{orderId}}",
+  },
+};
+```
+
+## Deduplication Strategy
+
+Duplicate notifications are a terrible user experience. We prevent them at two levels:
+
+1. **API level**: The `idempotencyKey` in the request — the caller generates it (e.g., `order-shipped-{orderId}`). Duplicate keys within a 24h window are rejected.
+2. **Worker level**: Before calling the third-party API, check the delivery store. This handles cases where the message was queued twice.
+
+## Retry and Dead Letter Queue
+
+```text
+Attempt 1: immediate
+Attempt 2: 30 seconds
+Attempt 3: 2 minutes
+Attempt 4: 15 minutes
+Attempt 5: 1 hour
+→ Move to Dead Letter Queue (DLQ) for manual review
+```
+
+Exponential backoff prevents hammering a failing provider. The DLQ ensures no notification is silently lost.
+
+## Batching and Digests
+
+Low-priority notifications (social activity, recommendations) should be batched:
+
+```text
+Instead of:
+  9:01 - "Alice liked your post"
+  9:03 - "Bob commented on your post"
+  9:07 - "Charlie followed you"
+
+Send:
+  10:00 - "You have 3 new notifications: Alice liked your post, Bob commented..."
+```
+
+A scheduled job aggregates undelivered low-priority notifications every hour and sends a digest.
+
+## Scaling Considerations
+
+| Component | Scaling Strategy |
+|-----------|-----------------|
+| Notification Service | Horizontal (stateless, behind LB) |
+| Kafka | Add partitions per topic as throughput grows |
+| Workers | Auto-scale based on queue depth |
+| Delivery Store | Partition by `created_at`, archive after 90 days |
+| In-App Store | TTL-based cleanup, Redis for unread counts |
+
+## Key Takeaways
+
+1. **Fan-out at the queue level**, not in the API handler — keeps latency low for the caller
+2. **Idempotency keys** are essential — duplicate notifications destroy trust
+3. **Priority queues** let critical notifications skip ahead of bulk sends
+4. **Template system** separates content from delivery logic — non-engineers can edit copy
+5. **Respect user preferences** at the service layer — never skip the preference check
+6. **Exponential backoff + DLQ** ensures reliability without overwhelming failing providers

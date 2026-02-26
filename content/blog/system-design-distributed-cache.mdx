@@ -1,0 +1,301 @@
+---
+title: "System Design: Distributed Caching with Redis and Memcached"
+description: "A practical guide to distributed caching — covering cache topologies, eviction policies, consistency patterns, and common pitfalls like thundering herds."
+date: "2026-02-08"
+published: true
+featured: false
+tags: ["system-design", "caching", "redis", "performance"]
+authors: ["Datto"]
+---
+
+## Why Distributed Caching?
+
+A cache is a high-speed data layer that stores a subset of data so future requests can be served faster than hitting the primary store. When your application spans multiple servers, you need a **shared, distributed cache** that all nodes can access.
+
+The numbers speak for themselves:
+
+```text
+PostgreSQL read:  5-50ms
+Redis read:       0.1-0.5ms
+Local memory:     0.001ms
+```
+
+Caching turns slow database queries into sub-millisecond lookups. But it introduces complexity — invalidation, consistency, and failure modes that you need to design for.
+
+## Cache Topologies
+
+### 1. Cache-Aside (Lazy Loading)
+
+The application manages the cache explicitly. This is the most common pattern.
+
+```typescript title="services/cache-aside.ts"
+async function getUser(userId: string): Promise<User> {
+  // 1. Check cache
+  const cached = await redis.get(`user:${userId}`);
+  if (cached) return JSON.parse(cached);
+
+  // 2. Cache miss → fetch from DB
+  const user = await db.user.findUnique({ where: { id: userId } });
+  if (!user) throw new NotFoundError("User not found");
+
+  // 3. Populate cache
+  await redis.setex(`user:${userId}`, 3600, JSON.stringify(user));
+
+  return user;
+}
+
+async function updateUser(userId: string, data: Partial<User>): Promise<User> {
+  const user = await db.user.update({ where: { id: userId }, data });
+
+  // Invalidate cache
+  await redis.del(`user:${userId}`);
+
+  return user;
+}
+```
+
+**Pros**: Only caches data that's actually requested. Simple.
+**Cons**: Cache miss penalty (extra round trip). Stale data possible between write and invalidation.
+
+### 2. Write-Through
+
+Every write goes to the cache and database simultaneously.
+
+```text
+Client → Cache (write) → Database (write)
+Client → Cache (read, always fresh)
+```
+
+**Pros**: Cache is always up to date.
+**Cons**: Write latency increases (two writes per operation). Caches data that may never be read.
+
+### 3. Write-Behind (Write-Back)
+
+Writes go to the cache immediately. The cache asynchronously flushes to the database.
+
+```text
+Client → Cache (write, return immediately)
+         Cache ──async──► Database
+```
+
+**Pros**: Lowest write latency. Can batch database writes.
+**Cons**: Data loss risk if cache fails before flush. Complex.
+
+### 4. Read-Through
+
+The cache itself fetches from the database on a miss, hiding the data source from the application.
+
+**For most applications, cache-aside is the right choice.** It's simple, predictable, and gives you full control.
+
+## Eviction Policies
+
+When cache memory is full, something has to go. The eviction policy determines what.
+
+| Policy | How It Works | Best For |
+|--------|-------------|----------|
+| **LRU** (Least Recently Used) | Evicts the key accessed longest ago | General purpose, most common |
+| **LFU** (Least Frequently Used) | Evicts the key with fewest accesses | When access patterns have clear hot keys |
+| **TTL** (Time To Live) | Keys expire after a set duration | Time-sensitive data (sessions, tokens) |
+| **Random** | Evicts a random key | When all keys have equal value |
+
+Redis defaults to `noeviction` (returns errors when full). For caching, configure `allkeys-lru`:
+
+```text
+maxmemory 4gb
+maxmemory-policy allkeys-lru
+```
+
+## The Thundering Herd Problem
+
+When a popular cache key expires, hundreds of concurrent requests all miss the cache simultaneously and hit the database:
+
+```text
+t=0:  Cache key "popular-page" expires
+t=0:  Request 1 → cache miss → DB query
+t=0:  Request 2 → cache miss → DB query
+t=0:  Request 3 → cache miss → DB query
+...   500 simultaneous DB queries for the same data
+```
+
+### Solution 1: Cache Stampede Lock
+
+Only one request rebuilds the cache. Others wait.
+
+```typescript title="lib/cache-lock.ts"
+async function getWithLock<T>(
+  key: string,
+  ttl: number,
+  fetcher: () => Promise<T>
+): Promise<T> {
+  // Try cache first
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  // Acquire lock
+  const lockKey = `lock:${key}`;
+  const acquired = await redis.set(lockKey, "1", "EX", 10, "NX");
+
+  if (acquired) {
+    try {
+      // We got the lock → fetch and populate
+      const data = await fetcher();
+      await redis.setex(key, ttl, JSON.stringify(data));
+      return data;
+    } finally {
+      await redis.del(lockKey);
+    }
+  }
+
+  // Another process holds the lock → wait and retry
+  await sleep(50);
+  return getWithLock(key, ttl, fetcher);
+}
+```
+
+### Solution 2: Stale-While-Revalidate
+
+Serve stale data immediately while refreshing in the background:
+
+```typescript title="lib/stale-while-revalidate.ts"
+async function getWithSWR<T>(
+  key: string,
+  ttl: number,
+  staleTtl: number,
+  fetcher: () => Promise<T>
+): Promise<T> {
+  const raw = await redis.get(key);
+  if (raw) {
+    const { data, refreshAt } = JSON.parse(raw);
+
+    if (Date.now() > refreshAt) {
+      // Stale — trigger background refresh
+      refreshInBackground(key, ttl, staleTtl, fetcher);
+    }
+
+    return data; // Return immediately (maybe stale)
+  }
+
+  // No data at all → must wait
+  const data = await fetcher();
+  await setWithRefresh(key, data, ttl, staleTtl);
+  return data;
+}
+```
+
+## Cache Invalidation Patterns
+
+Phil Karlton famously said there are only two hard problems in computer science: cache invalidation and naming things. Here's how to handle the first one.
+
+### Pattern 1: Direct Invalidation
+
+Delete the cache key when data changes.
+
+```typescript
+await db.product.update({ where: { id }, data });
+await redis.del(`product:${id}`);
+```
+
+Simple, but you need to know every cache key affected by a mutation.
+
+### Pattern 2: Tag-Based Invalidation
+
+Associate cache entries with tags. Invalidate all entries with a tag at once.
+
+```typescript title="lib/tagged-cache.ts"
+async function setWithTags(
+  key: string,
+  value: unknown,
+  ttl: number,
+  tags: string[]
+) {
+  await redis.setex(key, ttl, JSON.stringify(value));
+  for (const tag of tags) {
+    await redis.sadd(`tag:${tag}`, key);
+    await redis.expire(`tag:${tag}`, ttl);
+  }
+}
+
+async function invalidateTag(tag: string) {
+  const keys = await redis.smembers(`tag:${tag}`);
+  if (keys.length > 0) {
+    await redis.del(...keys);
+  }
+  await redis.del(`tag:${tag}`);
+}
+
+// Usage
+await setWithTags("product:123", product, 3600, ["products", "category:electronics"]);
+await invalidateTag("products"); // Clears all product caches
+```
+
+This is what Next.js uses with `revalidateTag()`.
+
+### Pattern 3: Event-Driven Invalidation
+
+Publish a cache invalidation event whenever data changes. All application instances listen and invalidate their local caches.
+
+```text
+DB Write → Publish "product.updated" event → All servers invalidate
+```
+
+## Redis vs Memcached
+
+| Feature | Redis | Memcached |
+|---------|-------|-----------|
+| Data structures | Strings, hashes, lists, sets, sorted sets | Strings only |
+| Persistence | RDB snapshots + AOF | None |
+| Replication | Built-in primary/replica | None |
+| Pub/Sub | Yes | No |
+| Lua scripting | Yes | No |
+| Memory efficiency | Good | Better (simpler overhead) |
+| Multi-threaded | Single-threaded (io-threads in v6+) | Multi-threaded |
+
+**Use Redis** when you need data structures, persistence, or Pub/Sub.
+**Use Memcached** for pure key-value caching with maximum memory efficiency.
+
+## Cache Warming
+
+Cold caches after a deployment can cause a surge of database queries. Pre-populate critical caches:
+
+```typescript title="scripts/warm-cache.ts"
+async function warmCache() {
+  // Top 1000 most-accessed products
+  const popular = await db.product.findMany({
+    orderBy: { viewCount: "desc" },
+    take: 1000,
+  });
+
+  const pipeline = redis.pipeline();
+  for (const product of popular) {
+    pipeline.setex(
+      `product:${product.id}`,
+      3600,
+      JSON.stringify(product)
+    );
+  }
+  await pipeline.exec();
+}
+```
+
+Run this as a post-deployment step or as part of your CI/CD pipeline.
+
+## Monitoring Metrics
+
+Track these to keep your cache healthy:
+
+| Metric | Target | Action if Off |
+|--------|--------|---------------|
+| Hit rate | > 95% | Increase TTL or cache more aggressively |
+| Eviction rate | Low | Increase memory or reduce TTL |
+| Memory usage | < 80% | Scale up or tune eviction policy |
+| Latency p99 | < 1ms | Check network, connection pooling |
+| Key count | Stable growth | Watch for key leaks (missing expiry) |
+
+## Key Takeaways
+
+1. **Cache-aside** is the right default pattern — simple and predictable
+2. Use **stampede locks or SWR** to prevent thundering herds on hot keys
+3. **Tag-based invalidation** scales better than tracking individual keys
+4. **TTL is your safety net** — even with explicit invalidation, always set an expiry
+5. **Monitor hit rate religiously** — a cache with < 80% hit rate may not be worth the complexity
+6. **Warm your cache** on deploys to avoid cold-start database spikes

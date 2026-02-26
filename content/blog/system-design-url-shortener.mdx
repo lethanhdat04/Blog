@@ -1,0 +1,213 @@
+---
+title: "System Design: Building a URL Shortener at Scale"
+description: "A deep dive into designing a URL shortener like Bitly — covering hashing strategies, database choices, caching layers, and handling billions of redirects."
+date: "2026-02-25"
+published: true
+featured: true
+tags: ["system-design", "architecture", "databases", "caching"]
+authors: ["Datto"]
+---
+
+## The Problem
+
+Design a URL shortening service like Bitly or TinyURL. Given a long URL, the service generates a short, unique alias. When users visit the short URL, they get redirected to the original.
+
+Sounds simple — but at scale, this touches on hashing, storage, caching, analytics, and high availability.
+
+## Requirements
+
+### Functional
+
+- Shorten a long URL into a unique short code
+- Redirect short URLs to the original
+- Custom aliases (optional)
+- Expiration (TTL) support
+- Click analytics (count, geo, referrer)
+
+### Non-Functional
+
+- **Low latency**: redirects must be fast (< 50ms p99)
+- **High availability**: the read path cannot go down
+- **Scale**: 100M URLs created/month, 10B redirects/month (~3,800 reads/sec, ~38 writes/sec)
+
+## Short Code Generation
+
+The core question: how do we generate unique, short codes?
+
+### Approach 1: Base62 Encoding of Auto-Increment ID
+
+```text
+ID: 123456789
+Base62: "8m0Kx"
+```
+
+A 7-character Base62 string gives us 62^7 = **3.5 trillion** unique codes. That's plenty.
+
+```typescript title="lib/encoding.ts"
+const ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+export function encode(num: number): string {
+  let result = "";
+  while (num > 0) {
+    result = ALPHABET[num % 62] + result;
+    num = Math.floor(num / 62);
+  }
+  return result.padStart(7, "0");
+}
+
+export function decode(code: string): number {
+  let num = 0;
+  for (const char of code) {
+    num = num * 62 + ALPHABET.indexOf(char);
+  }
+  return num;
+}
+```
+
+**Pros**: guaranteed unique, sequential, simple.
+**Cons**: predictable (users can guess the next URL), requires a single counter which becomes a bottleneck.
+
+### Approach 2: Pre-Generated Key Service
+
+A dedicated **Key Generation Service (KGS)** pre-generates random unique codes and stores them in a pool:
+
+```text
+┌──────────────┐     ┌──────────────┐
+│  KGS Worker  │────▶│  unused_keys │  (pre-generated pool)
+└──────────────┘     └──────────────┘
+                            │
+                     ┌──────▼──────┐
+                     │  used_keys  │  (assigned to URLs)
+                     └─────────────┘
+```
+
+When the API needs a new code, it grabs one atomically from the pool. This eliminates collisions and decouples code generation from the write path.
+
+### Approach 3: MD5/SHA256 Hash + Truncation
+
+Hash the long URL with MD5, take the first 7 characters of the Base62-encoded hash. Check for collisions and retry with a salt if needed.
+
+**We'll go with Approach 2** — it gives us randomness, no collisions, and can be scaled independently.
+
+## High-Level Architecture
+
+```text
+                    ┌─────────────┐
+    Client ────────▶│  API Gateway │
+                    │  (Rate Limit)│
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────┐
+        │  App     │ │  App     │ │  App     │
+        │  Server  │ │  Server  │ │  Server  │
+        └────┬─────┘ └────┬─────┘ └────┬─────┘
+             │             │             │
+             ▼             ▼             ▼
+        ┌─────────────────────────────────────┐
+        │            Redis Cache              │
+        │    (short_code → long_url)          │
+        └──────────────────┬──────────────────┘
+                           │ cache miss
+                           ▼
+        ┌─────────────────────────────────────┐
+        │         PostgreSQL / DynamoDB       │
+        │    urls: code, long_url, user_id,   │
+        │          created_at, expires_at     │
+        └─────────────────────────────────────┘
+```
+
+## Database Schema
+
+```sql title="schema.sql"
+CREATE TABLE urls (
+  id          BIGSERIAL PRIMARY KEY,
+  short_code  VARCHAR(7) UNIQUE NOT NULL,
+  long_url    TEXT NOT NULL,
+  user_id     UUID,
+  created_at  TIMESTAMPTZ DEFAULT NOW(),
+  expires_at  TIMESTAMPTZ,
+  click_count BIGINT DEFAULT 0
+);
+
+CREATE INDEX idx_urls_short_code ON urls(short_code);
+CREATE INDEX idx_urls_expires ON urls(expires_at) WHERE expires_at IS NOT NULL;
+```
+
+For the read path, `short_code` is the primary lookup key. A hash index or B-tree on `short_code` makes lookups O(1) or O(log n).
+
+## Caching Strategy
+
+Redirects are the hot path — 99% of traffic. We use a **two-tier cache**:
+
+1. **CDN/Edge Cache**: Cache 301 redirects at the edge. TTL 1 hour for non-expiring URLs.
+2. **Redis**: Application-level cache for short_code → long_url lookups.
+
+```typescript title="services/redirect.ts"
+async function resolve(shortCode: string): Promise<string | null> {
+  // L1: Redis
+  const cached = await redis.get(`url:${shortCode}`);
+  if (cached) return cached;
+
+  // L2: Database
+  const row = await db.query(
+    "SELECT long_url, expires_at FROM urls WHERE short_code = $1",
+    [shortCode]
+  );
+
+  if (!row || (row.expires_at && row.expires_at < new Date())) {
+    return null;
+  }
+
+  // Populate cache (24h TTL)
+  await redis.setex(`url:${shortCode}`, 86400, row.long_url);
+  return row.long_url;
+}
+```
+
+### Cache Hit Rate
+
+With a Zipfian distribution (a few URLs get most traffic), we can expect **95%+ cache hit rate** with just 20% of URLs cached.
+
+## Analytics Pipeline
+
+Click analytics should not block the redirect. We use an **async pipeline**:
+
+```text
+Redirect ──▶ Kafka Topic ──▶ Consumer ──▶ ClickHouse
+   │                                       (analytics DB)
+   └── 301/302 response (immediate)
+```
+
+Each redirect publishes an event with: `short_code`, `timestamp`, `ip`, `user_agent`, `referrer`. A consumer aggregates these into time-series analytics.
+
+## 301 vs 302 Redirects
+
+- **301 (Permanent)**: Browser caches it. Reduces server load but loses analytics visibility.
+- **302 (Temporary)**: Every click hits our server. Full analytics but higher load.
+
+**Decision**: Use 302 for URLs with analytics enabled, 301 for simple redirects.
+
+## Scaling Considerations
+
+| Concern | Solution |
+|---------|----------|
+| Write throughput | KGS pre-generates keys, bulk insert |
+| Read throughput | Redis cache + CDN edge caching |
+| Database growth | Partition by `created_at` month, archive expired URLs |
+| Single point of failure | Multi-region Redis replicas, database read replicas |
+| Rate limiting | API Gateway with token bucket per user/IP |
+
+## Estimated Storage
+
+- 100M URLs/month × 500 bytes/row = **50 GB/month**
+- 5 years = **3 TB** — manageable with partitioning and archival
+
+## Key Takeaways
+
+1. **Separate read and write paths** — they have vastly different traffic patterns
+2. **Pre-generate keys** to avoid collision-resolution overhead on the write path
+3. **Cache aggressively** — redirects are a perfect cache use case (immutable data)
+4. **Async analytics** — never block the user-facing redirect for background processing
+5. **Choose your redirect code carefully** — 301 vs 302 has real product implications

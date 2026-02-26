@@ -1,0 +1,247 @@
+---
+title: "System Design: Rate Limiting Strategies for APIs"
+description: "Explore token bucket, sliding window, and distributed rate limiting patterns to protect your APIs from abuse while ensuring fair usage."
+date: "2026-02-22"
+published: true
+featured: false
+tags: ["system-design", "api", "redis", "architecture"]
+authors: ["Datto"]
+---
+
+## Why Rate Limiting?
+
+Every public API needs rate limiting. Without it, a single client can exhaust your resources, degrade performance for everyone, and inflate your infrastructure costs.
+
+Rate limiting serves four purposes:
+
+- **Prevent abuse**: Stop DDoS attacks and scraping
+- **Fair usage**: Ensure equitable resource allocation across clients
+- **Cost control**: Protect downstream services and databases from overload
+- **Compliance**: Enforce API plan quotas (free tier: 100 req/hr, pro: 10K req/hr)
+
+## Core Algorithms
+
+### 1. Token Bucket
+
+The most widely used algorithm. Think of a bucket that fills with tokens at a constant rate. Each request consumes one token. If the bucket is empty, the request is rejected.
+
+```text
+Bucket capacity: 10 tokens
+Refill rate: 1 token/second
+
+t=0   [■■■■■■■■■■] 10 tokens → request allowed (9 left)
+t=0   [■■■■■■■■■ ] 9 tokens  → request allowed (8 left)
+...
+t=0   [          ] 0 tokens  → request REJECTED (429)
+t=1   [■         ] 1 token   → refilled, request allowed
+```
+
+```typescript title="lib/rate-limit/token-bucket.ts"
+interface TokenBucket {
+  tokens: number;
+  lastRefill: number;
+}
+
+function checkRateLimit(
+  bucket: TokenBucket,
+  capacity: number,
+  refillRate: number // tokens per second
+): { allowed: boolean; remaining: number } {
+  const now = Date.now();
+  const elapsed = (now - bucket.lastRefill) / 1000;
+
+  // Refill tokens
+  bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * refillRate);
+  bucket.lastRefill = now;
+
+  if (bucket.tokens >= 1) {
+    bucket.tokens -= 1;
+    return { allowed: true, remaining: Math.floor(bucket.tokens) };
+  }
+
+  return { allowed: false, remaining: 0 };
+}
+```
+
+**Pros**: Allows burst traffic up to bucket capacity. Simple and memory-efficient.
+**Cons**: Distributed implementation requires atomic operations.
+
+### 2. Fixed Window Counter
+
+Divide time into fixed windows (e.g., 1-minute intervals). Count requests per window. Reset at the window boundary.
+
+```text
+Window: 1 minute, Limit: 100
+
+12:00:00 - 12:00:59  →  [count: 78]  ✓ allowed
+12:01:00 - 12:01:59  →  [count: 100] ✓ just at limit
+12:01:30             →  [count: 101] ✗ rejected
+12:02:00 - 12:02:59  →  [count: 0]   ✓ counter reset
+```
+
+**Problem**: Boundary spikes. A client can send 100 requests at 12:00:59 and another 100 at 12:01:00 — effectively 200 requests in 2 seconds.
+
+### 3. Sliding Window Log
+
+Track the timestamp of every request. For each new request, remove entries older than the window, then count.
+
+```typescript title="lib/rate-limit/sliding-window-log.ts"
+async function slidingWindowLog(
+  redis: Redis,
+  key: string,
+  limit: number,
+  windowMs: number
+): Promise<boolean> {
+  const now = Date.now();
+  const windowStart = now - windowMs;
+
+  const pipeline = redis.pipeline();
+  pipeline.zremrangebyscore(key, 0, windowStart); // Remove old entries
+  pipeline.zadd(key, now, `${now}-${Math.random()}`); // Add current
+  pipeline.zcard(key); // Count entries
+  pipeline.expire(key, Math.ceil(windowMs / 1000)); // Auto-cleanup
+
+  const results = await pipeline.exec();
+  const count = results?.[2]?.[1] as number;
+
+  return count <= limit;
+}
+```
+
+**Pros**: No boundary spikes, precise.
+**Cons**: High memory usage — stores every request timestamp.
+
+### 4. Sliding Window Counter (Hybrid)
+
+The best of both worlds. Combine fixed window counts with proportional weighting from the previous window:
+
+```text
+Previous window count: 80 (12:00 - 12:01)
+Current window count:  30 (12:01 - 12:02)
+Current position: 12:01:15 (25% into current window)
+
+Weighted count = 80 × (1 - 0.25) + 30 = 60 + 30 = 90
+Limit: 100 → allowed
+```
+
+```typescript title="lib/rate-limit/sliding-window-counter.ts"
+async function slidingWindowCounter(
+  redis: Redis,
+  key: string,
+  limit: number,
+  windowMs: number
+): Promise<{ allowed: boolean; remaining: number }> {
+  const now = Date.now();
+  const currentWindow = Math.floor(now / windowMs);
+  const previousWindow = currentWindow - 1;
+  const elapsed = (now % windowMs) / windowMs; // 0.0 to 1.0
+
+  const [prev, curr] = await Promise.all([
+    redis.get(`${key}:${previousWindow}`),
+    redis.get(`${key}:${currentWindow}`),
+  ]);
+
+  const prevCount = parseInt(prev || "0");
+  const currCount = parseInt(curr || "0");
+  const weighted = prevCount * (1 - elapsed) + currCount;
+
+  if (weighted >= limit) {
+    return { allowed: false, remaining: 0 };
+  }
+
+  await redis.pipeline()
+    .incr(`${key}:${currentWindow}`)
+    .expire(`${key}:${currentWindow}`, Math.ceil(windowMs / 1000) * 2)
+    .exec();
+
+  return { allowed: true, remaining: Math.floor(limit - weighted - 1) };
+}
+```
+
+**This is what I recommend for most use cases.** Low memory (2 counters), no boundary spikes, simple to implement.
+
+## Distributed Rate Limiting
+
+In a multi-server deployment, each server needs a shared view of the rate limit state. Redis is the standard solution.
+
+### Architecture
+
+```text
+┌─────────┐  ┌─────────┐  ┌─────────┐
+│ Server 1│  │ Server 2│  │ Server 3│
+└────┬────┘  └────┬────┘  └────┬────┘
+     │            │            │
+     └────────────┼────────────┘
+                  │
+          ┌───────▼───────┐
+          │  Redis Cluster │
+          │  (rate state)  │
+          └───────────────┘
+```
+
+### Lua Script for Atomicity
+
+Redis Lua scripts execute atomically — no race conditions:
+
+```lua title="scripts/rate_limit.lua"
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+
+local current = tonumber(redis.call("GET", key) or "0")
+
+if current >= limit then
+  return 0  -- rejected
+end
+
+if current == 0 then
+  redis.call("SET", key, 1, "PX", window)
+else
+  redis.call("INCR", key)
+end
+
+return limit - current - 1  -- remaining
+```
+
+## Response Headers
+
+Always communicate rate limit state to clients:
+
+```text
+HTTP/1.1 200 OK
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 67
+X-RateLimit-Reset: 1709078400
+
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1709078400
+```
+
+## Multi-Tier Rate Limiting
+
+Real systems use multiple layers:
+
+| Layer | Scope | Algorithm | Limit |
+|-------|-------|-----------|-------|
+| API Gateway | Per-IP | Token bucket | 1000 req/min |
+| Application | Per-API-key | Sliding window counter | Based on plan |
+| Per-endpoint | Per-user + endpoint | Fixed window | 10 req/sec for write endpoints |
+| Global | Service-wide | Token bucket | 50K req/sec (circuit breaker) |
+
+## Edge Cases to Handle
+
+1. **Clock skew**: In distributed systems, server clocks differ. Use Redis server time, not application time.
+2. **Race conditions**: Use Lua scripts or `MULTI/EXEC` for atomic check-and-increment.
+3. **Graceful degradation**: If Redis is down, fail open (allow requests) or fail closed (reject all) based on your risk tolerance.
+4. **Key cardinality**: With millions of API keys, consider key expiration and memory limits.
+
+## Key Takeaways
+
+1. **Sliding window counter** is the best general-purpose algorithm — low memory, no boundary spikes
+2. **Token bucket** is ideal when you want to allow controlled bursts
+3. Use **Redis Lua scripts** for atomic distributed rate limiting
+4. Implement **multi-tier limits** — different granularities catch different abuse patterns
+5. Always return **rate limit headers** — good API citizenship

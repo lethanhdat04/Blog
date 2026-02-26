@@ -1,0 +1,298 @@
+---
+title: "System Design: Real-Time Chat Application"
+description: "Design a WhatsApp-like chat system with WebSocket connections, message delivery guarantees, read receipts, and offline message sync."
+date: "2026-02-12"
+published: true
+featured: false
+tags: ["system-design", "websocket", "architecture", "real-time"]
+authors: ["Datto"]
+---
+
+## The Problem
+
+Design a real-time messaging system similar to WhatsApp or Slack. Users can send 1:1 messages, create group chats, share media, and see online/typing indicators — all with guaranteed delivery and message ordering.
+
+## Requirements
+
+### Functional
+
+- 1:1 messaging and group chats (up to 500 members)
+- Media sharing (images, files)
+- Online/offline status and typing indicators
+- Read receipts (sent → delivered → read)
+- Message history and search
+- Offline message sync (push notifications when offline)
+
+### Non-Functional
+
+- **Latency**: Messages delivered in < 200ms for online users
+- **Consistency**: Messages must never be lost, ordering must be preserved
+- **Scale**: 50M DAU, 1B messages/day (~11,500 messages/sec)
+- **Availability**: 99.99% uptime
+
+## Connection Strategy: WebSockets
+
+HTTP polling is wasteful for real-time chat. WebSockets provide full-duplex, persistent connections.
+
+```text
+Client ◄──── WebSocket ────► Chat Server
+       (persistent, bidirectional)
+```
+
+### Connection Lifecycle
+
+```typescript title="services/ws-connection.ts"
+interface ConnectionManager {
+  // userId → Set of WebSocket connections (multi-device)
+  connections: Map<string, Set<WebSocket>>;
+
+  register(userId: string, ws: WebSocket): void;
+  unregister(userId: string, ws: WebSocket): void;
+  send(userId: string, message: ChatMessage): void;
+  isOnline(userId: string): boolean;
+}
+```
+
+Users may be connected from multiple devices. The connection manager tracks all active sockets per user.
+
+## High-Level Architecture
+
+```text
+┌─────────┐    WebSocket    ┌──────────────────┐
+│  Client  │◄──────────────►│   Chat Server    │
+│  (App)   │                │  (WS Handler)    │
+└─────────┘                 └────────┬─────────┘
+                                     │
+                              ┌──────▼──────┐
+                              │   Redis Pub/ │
+                              │   Sub        │
+                              └──────┬──────┘
+                                     │
+                    ┌────────────────┼────────────────┐
+                    ▼                ▼                ▼
+             ┌────────────┐  ┌────────────┐  ┌────────────┐
+             │ Chat Server│  │ Chat Server│  │ Chat Server│
+             │  Node 1    │  │  Node 2    │  │  Node 3    │
+             └────────────┘  └────────────┘  └────────────┘
+                    │                │                │
+                    └────────────────┼────────────────┘
+                                     ▼
+                    ┌────────────────────────────────┐
+                    │         Message Store           │
+                    │  (Cassandra / ScyllaDB)         │
+                    └────────────────────────────────┘
+```
+
+The key challenge: **sender and receiver may be on different server nodes**. Redis Pub/Sub bridges this gap.
+
+## Message Flow
+
+### Sending a Message
+
+```text
+1. Alice sends message via WebSocket to Chat Server A
+2. Server A:
+   a. Generates message_id (Snowflake ID for ordering)
+   b. Persists to Message Store
+   c. Publishes to Redis channel "user:{bobId}"
+3. Chat Server B (where Bob is connected):
+   a. Receives from Redis subscription
+   b. Pushes to Bob's WebSocket
+4. Server A sends ACK back to Alice (message_id + "sent" status)
+5. When Bob's client receives → sends "delivered" ack
+6. When Bob reads → sends "read" ack
+```
+
+### Message States
+
+```text
+SENDING → SENT → DELIVERED → READ
+  (client)  (server ack)  (recipient device)  (recipient opened)
+```
+
+```typescript title="types/message.ts"
+interface ChatMessage {
+  id: string;           // Snowflake ID (sortable, unique)
+  conversationId: string;
+  senderId: string;
+  type: "text" | "image" | "file" | "system";
+  content: string;
+  mediaUrl?: string;
+  status: "sending" | "sent" | "delivered" | "read";
+  replyTo?: string;     // For threaded replies
+  createdAt: number;    // Unix timestamp (ms)
+}
+```
+
+## Message Ordering
+
+Distributed systems make ordering hard. We use **Snowflake IDs** — 64-bit IDs that are both unique and roughly time-ordered:
+
+```text
+Snowflake ID structure (64 bits):
+┌──────────────────┬────────────┬──────────────┐
+│  41 bits: time   │ 10 bits:   │ 12 bits:     │
+│  (ms since epoch)│ machine ID │ sequence     │
+└──────────────────┴────────────┴──────────────┘
+```
+
+Within a conversation, messages are ordered by Snowflake ID. This gives us:
+- **Global uniqueness** without coordination
+- **Rough time ordering** (good enough for chat)
+- **Sortable** — newer messages always have higher IDs
+
+## Database Schema
+
+Chat data is **write-heavy** and **read-by-key** — a perfect fit for Cassandra/ScyllaDB.
+
+```sql title="cassandra-schema.cql"
+-- Messages partitioned by conversation, ordered by time
+CREATE TABLE messages (
+  conversation_id UUID,
+  message_id      BIGINT,   -- Snowflake ID
+  sender_id       UUID,
+  type            TEXT,
+  content         TEXT,
+  media_url       TEXT,
+  reply_to        BIGINT,
+  created_at      TIMESTAMP,
+  PRIMARY KEY (conversation_id, message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
+
+-- User's conversation list
+CREATE TABLE user_conversations (
+  user_id           UUID,
+  conversation_id   UUID,
+  last_message_id   BIGINT,
+  last_message_text TEXT,
+  unread_count      INT,
+  updated_at        TIMESTAMP,
+  PRIMARY KEY (user_id, updated_at)
+) WITH CLUSTERING ORDER BY (updated_at DESC);
+```
+
+### Why Cassandra?
+
+| Requirement | Cassandra Fit |
+|-------------|---------------|
+| Write-heavy (1B msgs/day) | Optimized for writes |
+| Read by partition key | conversation_id → fast lookups |
+| Time-series ordering | Clustering order by message_id |
+| Horizontal scaling | Linear scalability with nodes |
+| Multi-region | Built-in replication |
+
+## Presence System (Online Status)
+
+Tracking who's online requires heartbeats:
+
+```text
+Client → sends heartbeat every 30s via WebSocket
+Server → updates Redis: SET user:{id}:presence {timestamp} EX 60
+```
+
+To check if a user is online:
+
+```typescript title="services/presence.ts"
+async function getPresence(userId: string): Promise<"online" | "offline"> {
+  const lastSeen = await redis.get(`user:${userId}:presence`);
+  return lastSeen ? "online" : "offline";
+}
+
+async function getGroupPresence(
+  userIds: string[]
+): Promise<Record<string, "online" | "offline">> {
+  const pipeline = redis.pipeline();
+  userIds.forEach((id) => pipeline.get(`user:${id}:presence`));
+  const results = await pipeline.exec();
+
+  return Object.fromEntries(
+    userIds.map((id, i) => [id, results?.[i]?.[1] ? "online" : "offline"])
+  );
+}
+```
+
+## Offline Message Delivery
+
+When a user is offline, messages still need to reach them:
+
+1. **Message is persisted** in the message store regardless of online status
+2. **Push notification** is sent via FCM/APNs for mobile devices
+3. **Unread counter** is incremented in `user_conversations`
+4. When the user comes online, the client **syncs** by fetching messages with `message_id > lastSyncedId`
+
+```typescript title="services/sync.ts"
+async function syncMessages(
+  userId: string,
+  lastSyncedId: bigint
+): Promise<ChatMessage[]> {
+  // Fetch user's conversations
+  const conversations = await db.getUserConversations(userId);
+
+  // For each conversation, get new messages
+  const newMessages = await Promise.all(
+    conversations.map((conv) =>
+      db.getMessages(conv.conversationId, {
+        afterId: lastSyncedId,
+        limit: 100,
+      })
+    )
+  );
+
+  return newMessages.flat().sort((a, b) =>
+    Number(BigInt(a.id) - BigInt(b.id))
+  );
+}
+```
+
+## Group Chat Fan-Out
+
+For group messages, we need to deliver to all members. Two strategies:
+
+### Fan-Out on Write
+
+When a message is sent to a group, write a copy to each member's queue. Fast reads, but expensive writes for large groups.
+
+### Fan-Out on Read (Recommended for large groups)
+
+Store the message once, keyed by `conversation_id`. Each member reads from the shared partition. The `user_conversations` table tracks unread counts.
+
+```text
+Small groups (< 50): Fan-out on write (lower read latency)
+Large groups (50-500): Fan-out on read (lower write cost)
+```
+
+## Media Handling
+
+Images and files should never flow through the chat server:
+
+```text
+1. Client requests pre-signed upload URL from API
+2. Client uploads directly to S3/CloudFlare R2
+3. Client sends message with media_url pointing to CDN
+4. Recipients fetch media from CDN
+```
+
+This keeps the chat server lean — it only handles text payloads and metadata.
+
+## Scaling Considerations
+
+| Component | Strategy |
+|-----------|----------|
+| WebSocket servers | Horizontal scale, sticky sessions via user_id hash |
+| Redis Pub/Sub | Redis Cluster with sharding by user_id |
+| Message Store | Cassandra ring, partition by conversation_id |
+| Media | S3 + CDN, pre-signed URLs |
+| Search | Elasticsearch index on message content |
+
+### Connection Limits
+
+A single server can handle ~500K concurrent WebSocket connections with proper tuning. For 50M DAU (assuming 30% concurrent = 15M), we need ~30 WebSocket servers.
+
+## Key Takeaways
+
+1. **WebSockets for real-time**, Redis Pub/Sub for cross-server message routing
+2. **Snowflake IDs** solve both uniqueness and ordering without coordination
+3. **Cassandra** is ideal for chat — write-heavy, partition-key reads, time-series data
+4. **Fan-out strategy** depends on group size — small groups on write, large groups on read
+5. **Offline sync** with an ID-based cursor is simpler and more reliable than timestamp-based
+6. **Keep media off the chat path** — pre-signed URLs and CDN delivery

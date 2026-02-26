@@ -1,0 +1,306 @@
+---
+title: "System Design: Event-Driven Architecture with Kafka"
+description: "Learn how to design event-driven systems using Apache Kafka — covering event sourcing, CQRS, saga patterns, and building loosely coupled microservices."
+date: "2026-02-05"
+published: true
+featured: true
+tags: ["system-design", "kafka", "microservices", "architecture"]
+authors: ["Datto"]
+---
+
+## What Is Event-Driven Architecture?
+
+In a traditional request-driven system, services call each other directly. Service A sends a request to Service B and waits for a response. This creates tight coupling — if B is down, A fails.
+
+In an event-driven architecture, services communicate through **events**. Service A publishes an event ("order placed"). Services B, C, and D react independently. No service knows about the others.
+
+```text
+Request-Driven:
+  OrderService → PaymentService → InventoryService → EmailService
+  (chain of synchronous calls, single point of failure at each step)
+
+Event-Driven:
+  OrderService → publishes "OrderPlaced"
+    ├── PaymentService (subscribes, processes payment)
+    ├── InventoryService (subscribes, reserves stock)
+    └── EmailService (subscribes, sends confirmation)
+```
+
+## Core Concepts
+
+### Events vs Commands vs Queries
+
+| Type | Direction | Example | Semantics |
+|------|-----------|---------|-----------|
+| Event | Broadcast | "OrderPlaced" | Something happened (past tense) |
+| Command | Targeted | "ProcessPayment" | Do something (imperative) |
+| Query | Request/Response | "GetOrderStatus" | Ask something (synchronous) |
+
+Events are **facts about the past**. They're immutable and can be consumed by any number of subscribers. This is the foundation of loose coupling.
+
+### Event Schema
+
+```typescript title="events/order-events.ts"
+interface OrderPlacedEvent {
+  eventId: string;
+  eventType: "order.placed";
+  timestamp: string;
+  version: 1;
+  data: {
+    orderId: string;
+    userId: string;
+    items: Array<{
+      productId: string;
+      quantity: number;
+      price: number;
+    }>;
+    totalAmount: number;
+    currency: string;
+  };
+  metadata: {
+    correlationId: string;  // Traces the event chain
+    causationId: string;    // What caused this event
+    source: string;         // "order-service"
+  };
+}
+```
+
+Always version your events. When the schema evolves, consumers can handle both old and new formats.
+
+## Apache Kafka: The Event Backbone
+
+Kafka is the de facto standard for event streaming. Here's why:
+
+```text
+┌──────────────┐
+│   Producer   │──────▶ Topic: "orders"
+└──────────────┘       ┌─────────────────┐
+                       │  Partition 0    │──▶ Consumer Group A
+                       │  Partition 1    │      (Payment Service)
+                       │  Partition 2    │
+                       └─────────────────┘
+                              │
+                              └──▶ Consumer Group B
+                                    (Analytics Service)
+```
+
+### Key Properties
+
+- **Ordered within partitions**: Messages in the same partition are strictly ordered
+- **Durable**: Events are persisted to disk with configurable retention
+- **Replayable**: Consumers can seek to any offset and reprocess events
+- **High throughput**: Millions of events/sec with horizontal scaling
+
+### Partition Strategy
+
+Partition by a key that groups related events:
+
+```typescript title="producers/order-producer.ts"
+await kafka.produce({
+  topic: "orders",
+  key: order.userId,  // All events for a user go to same partition
+  value: JSON.stringify(event),
+});
+```
+
+This ensures all events for a user are processed in order by a single consumer.
+
+## Pattern 1: Event Sourcing
+
+Instead of storing the **current state** of an entity, store the **sequence of events** that led to it.
+
+```text
+Traditional (state-based):
+  orders table: { id: "123", status: "shipped", total: 99.00 }
+
+Event Sourced:
+  events table:
+    1. OrderPlaced    { orderId: "123", total: 99.00 }
+    2. PaymentReceived { orderId: "123", amount: 99.00 }
+    3. OrderShipped   { orderId: "123", carrier: "FedEx" }
+```
+
+To get the current state, replay all events for that entity:
+
+```typescript title="aggregates/order.ts"
+class OrderAggregate {
+  id: string = "";
+  status: string = "pending";
+  total: number = 0;
+  items: OrderItem[] = [];
+
+  apply(event: OrderEvent): void {
+    switch (event.eventType) {
+      case "order.placed":
+        this.id = event.data.orderId;
+        this.status = "placed";
+        this.total = event.data.totalAmount;
+        this.items = event.data.items;
+        break;
+      case "payment.received":
+        this.status = "paid";
+        break;
+      case "order.shipped":
+        this.status = "shipped";
+        break;
+      case "order.cancelled":
+        this.status = "cancelled";
+        break;
+    }
+  }
+}
+
+function rehydrate(events: OrderEvent[]): OrderAggregate {
+  const aggregate = new OrderAggregate();
+  events.forEach((e) => aggregate.apply(e));
+  return aggregate;
+}
+```
+
+**Why event sourcing?**
+- Complete audit trail — you know exactly what happened and when
+- Temporal queries — "What was the order state at 3pm yesterday?"
+- Replayability — rebuild state from events, fix bugs retroactively
+- Debugging — trace exactly what led to a bad state
+
+## Pattern 2: CQRS (Command Query Responsibility Segregation)
+
+Separate the **write model** (commands) from the **read model** (queries). They can use different databases optimized for their access patterns.
+
+```text
+┌──────────┐  Command   ┌──────────────┐   Events   ┌─────────────┐
+│  Client   │──────────▶│ Write Service │───────────▶│    Kafka    │
+└──────────┘           └──────────────┘            └──────┬──────┘
+                                                          │
+     ┌──────────┐  Query   ┌──────────────┐              │
+     │  Client   │────────▶│ Read Service  │◀─────────────┘
+     └──────────┘          └──────┬───────┘   (projection)
+                                  │
+                           ┌──────▼──────┐
+                           │ Read-Optimized│
+                           │ Store (ES/   │
+                           │ DynamoDB)    │
+                           └─────────────┘
+```
+
+The read model is a **projection** — a denormalized view built from events. Different projections can serve different query patterns from the same event stream.
+
+## Pattern 3: Saga (Distributed Transactions)
+
+In microservices, you can't use traditional ACID transactions across services. Sagas orchestrate multi-step workflows with compensating actions for failures.
+
+### Choreography-Based Saga
+
+Each service reacts to events and publishes its own events. No central coordinator.
+
+```text
+OrderPlaced ──▶ PaymentService
+                   │
+              PaymentSucceeded ──▶ InventoryService
+                                       │
+                                  StockReserved ──▶ ShippingService
+                                                       │
+                                                  ShipmentCreated ──▶ done
+
+              PaymentFailed ──▶ OrderService
+                                   │
+                              OrderCancelled (compensating action)
+```
+
+### Orchestration-Based Saga
+
+A central **Saga Orchestrator** coordinates the steps:
+
+```typescript title="sagas/order-saga.ts"
+class OrderSaga {
+  private steps = [
+    {
+      action: "payment.process",
+      compensation: "payment.refund",
+    },
+    {
+      action: "inventory.reserve",
+      compensation: "inventory.release",
+    },
+    {
+      action: "shipping.create",
+      compensation: "shipping.cancel",
+    },
+  ];
+
+  async execute(orderId: string): Promise<void> {
+    const completed: string[] = [];
+
+    for (const step of this.steps) {
+      try {
+        await this.executeStep(step.action, orderId);
+        completed.push(step.compensation);
+      } catch {
+        // Failure → compensate in reverse order
+        for (const compensation of completed.reverse()) {
+          await this.executeStep(compensation, orderId);
+        }
+        throw new SagaFailedError(orderId, step.action);
+      }
+    }
+  }
+}
+```
+
+**Choreography** is simpler for 2-3 services but becomes hard to trace. **Orchestration** adds a central point but is easier to understand and debug.
+
+## Idempotent Consumers
+
+Events may be delivered more than once (at-least-once delivery). Consumers must be idempotent:
+
+```typescript title="consumers/payment-consumer.ts"
+async function handleOrderPlaced(event: OrderPlacedEvent) {
+  // Idempotency: check if already processed
+  const existing = await db.processedEvents.findUnique({
+    where: { eventId: event.eventId },
+  });
+  if (existing) return; // Already handled
+
+  // Process the event
+  await db.$transaction([
+    db.payment.create({ data: { orderId: event.data.orderId, ... } }),
+    db.processedEvents.create({ data: { eventId: event.eventId } }),
+  ]);
+}
+```
+
+Store the `eventId` in the same transaction as the side effect. This guarantees exactly-once processing semantics.
+
+## Dead Letter Queue (DLQ)
+
+Events that fail after all retries go to a DLQ for investigation:
+
+```text
+Main Topic ──▶ Consumer ──(fails 3x)──▶ DLQ Topic
+                                            │
+                                     Manual review / replay
+```
+
+Never silently drop events. A DLQ is your safety net for debugging production issues.
+
+## Monitoring an Event-Driven System
+
+| Metric | What It Tells You |
+|--------|-------------------|
+| Consumer lag | How far behind consumers are from producers |
+| Event throughput | Events/sec per topic — capacity planning |
+| Processing latency | Time from event published to consumed |
+| DLQ depth | Number of failed events requiring attention |
+| Consumer group rebalances | Frequent rebalances indicate instability |
+
+Consumer lag is the single most important metric. If lag grows, you need more consumers or your processing is too slow.
+
+## Key Takeaways
+
+1. **Events are facts, not commands** — name them in past tense, make them immutable
+2. **Partition by entity ID** to maintain ordering for related events
+3. **Event sourcing** gives you a complete audit trail and temporal queries — but adds complexity
+4. **CQRS** lets you optimize reads and writes independently
+5. **Sagas** replace distributed transactions — plan your compensating actions
+6. **Idempotent consumers** are non-negotiable with at-least-once delivery
+7. **Monitor consumer lag** — it's the heartbeat of your event-driven system
